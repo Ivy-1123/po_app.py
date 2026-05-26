@@ -68,14 +68,13 @@ def calculate_po_alerts(row):
         
     return '无预警', 99
 
-# ==================== 📡 智能表头特征识别引擎 ====================
+# ==================== 📡 智能表头特征识别与寻标清洗引擎 ====================
 st.sidebar.header("📂 原始 PO 数据上传区")
 uploaded_files = st.sidebar.file_uploader(
     "请一次性多选上传你的 4 个原始表格 (无需修改文件名，直接拖入)", 
     accept_multiple_files=True
 )
 
-# 【核心修正】：在最前方补齐 try 语句块，防止语法中断崩溃
 try:
     if uploaded_files:
         @st.cache_data(show_spinner=False)
@@ -147,8 +146,40 @@ try:
             po_df = dfs['po']
             asin_df = dfs['asin']
             
-            asin_df.iloc[:, 0] = asin_df.iloc[:, 0].ffill()
+            # 【高阶核心重构】：动态扫描 ASIN 表的所有列名，建立不畏惧空格和大小写的自适应索引映射
+            asin_cols = [str(c).strip() for c in asin_df.columns]
+            asin_cols_lower = [c.lower() for c in asin_cols]
             
+            def get_col_name_fallback(keywords, default_idx):
+                for kw in keywords:
+                    for i, c in enumerate(asin_cols_lower):
+                        if kw in c:
+                            return asin_cols[i]
+                if default_idx < len(asin_cols):
+                    return asin_cols[default_idx]
+                return asin_cols[0]
+
+            # 动态映射列名
+            col_parent = get_col_name_fallback(['parent', 'father'], 0)
+            col_asin = get_col_name_fallback(['asin'], 1)
+            col_itemno = get_col_name_fallback(['itemno', 'item_no', 'item'], 2)
+            col_division = get_col_name_fallback(['division', 'div'], 3)
+            col_brand = get_col_name_fallback(['brand'], 4)
+            col_category = get_col_name_fallback(['category'], 5)
+            col_subcat = get_col_name_fallback(['subcategory', 'sub_category'], 6)
+            col_pattern = get_col_name_fallback(['pattern'], 7)
+            col_color = get_col_name_fallback(['color'], 8)
+            col_size = get_col_name_fallback(['size'], 9)
+            col_om = get_col_name_fallback(['om'], 11)
+            col_buckets = get_col_name_fallback(['buckets', 'bucket'], 12)
+            col_class = get_col_name_fallback(['classification', 'classcode', 'code'], 13)
+            col_tag = get_col_name_fallback(['producttag', 'tag'], 15)
+            col_status = get_col_name_fallback(['status', 'retail'], 18)
+
+            # 强制向下填充父体 ASIN 区块
+            asin_df[col_parent] = asin_df[col_parent].ffill()
+            
+            # 5. 销量重算
             po_df['Requested_Units_Calc'] = po_df['Requested quantity'].apply(safe_float) * po_df['Case size'].apply(safe_float)
             po_df['Total_Cost_Calc'] = po_df['Total requested cost'].apply(safe_float)
             
@@ -159,11 +190,14 @@ try:
                 'Window end': 'max'
             }).reset_index()
             
-            asin_df = asin_df[~asin_df['Division'].isin(['PET', 'PETB', 'FUR', 'ART', 'LGT', 'RUG'])]
-            asin_df = asin_df[~asin_df['ClassificationCode'].isin(['C', 'ARC'])]
-            asin_df = asin_df[~asin_df['OM'].astype(str).str.lower().isin(['discontinued'])]
+            # 6. 过滤清洗规则 (使用动态映射)
+            asin_df = asin_df[~asin_df[col_division].isin(['PET', 'PETB', 'FUR', 'ART', 'LGT', 'RUG'])]
+            asin_df = asin_df[~asin_df[col_class].isin(['C', 'ARC'])]
+            asin_df = asin_df[~asin_df[col_om].astype(str).str.lower().isin(['discontinued'])]
             
-            master = pd.merge(asin_df, po_agg, on='ASIN', how='left')
+            # 7. 多表交叉全连接
+            master = pd.merge(asin_df, po_agg, left_on=col_asin, right_on='ASIN', how='left')
+            # 移除合并可能产生的冲突，确保主键唯一
             master['has_PO'] = master['Requested_Units_Calc'].notna()
             master['PO_Units'] = master['Requested_Units_Calc'].fillna(0)
             master['This_Wk_Cost'] = master['Total_Cost_Calc'].fillna(0)
@@ -172,7 +206,7 @@ try:
                 ppm_col = [c for c in dfs['ppm'].columns if 'ppm' in str(c).lower()][0]
                 ppm_sub = dfs['ppm'][['ASIN', ppm_col]].copy()
                 ppm_sub['Net_PPM_Val'] = ppm_sub[ppm_col].apply(safe_float)
-                master = pd.merge(master, ppm_sub[['ASIN', 'Net_PPM_Val']], on='ASIN', how='left')
+                master = pd.merge(master, ppm_sub[['ASIN', 'Net_PPM_Val']], left_on=col_asin, right_on='ASIN', how='left', suffixes=('', '_ppm'))
             else:
                 master['Net_PPM_Val'] = 0.0
 
@@ -185,31 +219,50 @@ try:
                 w5_8_mean = p70_df[w1_8_cols[4:8]].map(safe_float).mean(axis=1)
                 p70_df['trend_pct'] = (w5_8_mean - w1_4_mean) / w1_4_mean.replace(0, np.nan)
                 p70_df['trend_pct'] = p70_df['trend_pct'].fillna(0.0)
-                master = pd.merge(master, p70_df[['ASIN', 'P70_Avg', 'trend_pct']], on='ASIN', how='left')
+                master = pd.merge(master, p70_df[['ASIN', 'P70_Avg', 'trend_pct']], left_on=col_asin, right_on='ASIN', how='left', suffixes=('', '_p70'))
             else:
                 master['P70_Avg'] = 0.0
                 master['trend_pct'] = 0.0
 
-            master['FC_OnHand'] = master['FC inventory'].apply(safe_float)
-            master['FC_Incoming'] = master['FC Incoming'].apply(safe_float)
+            # 兼容读取库存列
+            inv_col = [c for c in master.columns if 'jla inventory' in str(c).lower() or 'jla_inv' in str(c).lower() or 'jla inventory' in str(c).lower()]
+            fc_col = [c for c in master.columns if 'fc inventory' in str(c).lower() or 'fc_onhand' in str(c).lower()]
+            fcin_col = [c for c in master.columns if 'fc incoming' in str(c).lower() or 'fc_incoming' in str(c).lower()]
+
+            master['FC_OnHand'] = master[fc_col[0]].apply(safe_float) if fc_col else 0.0
+            master['FC_Incoming'] = master[fcin_col[0]].apply(safe_float) if fcin_col else 0.0
             master['FC_Total'] = master['FC_OnHand'] + master['FC_Incoming']
-            master['JLA_Inv'] = master['JLA Inventory'].apply(safe_float)
+            master['JLA_Inv'] = master[inv_col[0]].apply(safe_float) if inv_col else 0.0
             
             master['AMZ_WOS'] = master['FC_Total'] / master['P70_Avg'].replace(0, np.nan)
             master.loc[(master['P70_Avg'] == 0) & (master['FC_Total'] > 0), 'AMZ_WOS'] = 999.0
             master['AMZ_WOS'] = master['AMZ_WOS'].fillna(0.0)
 
-            master['Product Tag'] = master['ProductTag'].fillna('Old')
+            master['Product Tag'] = master[col_tag].fillna('Old')
             master['波动驱动因素'] = master.apply(lambda r: build_driving_factors_text(r['PO_Units'], r['FC_Total'], r['This_Wk_Cost'], 1.0, 1.0, 1.0), axis=1)
+
+            # 统一回填业务主列名供后面打包使用（安全隔离层）
+            master['Final_Parent'] = master[col_parent]
+            master['Final_ASIN'] = master[col_asin] if col_asin in master.columns else master['ASIN']
+            master['Final_ItemNo'] = master[col_itemno]
+            master['Final_Division'] = master[col_division]
+            master['Final_Brand'] = master[col_brand]
+            master['Final_Category'] = master[col_category]
+            master['Final_Subcat'] = master[col_subcat]
+            master['Final_Pattern'] = master[col_pattern]
+            master['Final_Color'] = master[col_color]
+            master['Final_Size'] = master[col_size]
+            master['Final_OM'] = master[col_om]
+            master['Final_Buckets'] = master[col_buckets]
+            master['Final_Class'] = master[col_class]
+            master['Final_Status'] = master[col_status]
 
             master['Alert_Result'] = master.apply(calculate_po_alerts, axis=1)
             master['Alert_Type'] = master['Alert_Result'].apply(lambda x: x[0])
             master['Alert_Pri'] = master['Alert_Result'].apply(lambda x: x[1])
             
-            try:
-                odate = pd.to_datetime(po_df['Order date']).max().strftime('%Y-%m-%d')
-            except:
-                odate = datetime.now().strftime('%Y-%m-%d')
+            try: odate = pd.to_datetime(po_df['Order date']).max().strftime('%Y-%m-%d')
+            except: odate = datetime.now().strftime('%Y-%m-%d')
             return master, odate, None
 
         master_df, order_date, err = load_and_merge_po_system(uploaded_files)
@@ -219,14 +272,14 @@ try:
             
         # ==================== 🎛️ 侧边栏过滤 ====================
         st.sidebar.header("🎛️ 全局看板条件过滤")
-        om_options = sorted([str(x) for x in master_df['OM'].unique() if pd.notna(x) and str(x).strip() != ''])
-        pattern_options = sorted([str(x) for x in master_df['Pattern'].unique() if pd.notna(x) and str(x).strip() != ''])
+        om_options = sorted([str(x) for x in master_df['Final_OM'].unique() if pd.notna(x) and str(x).strip() != ''])
+        pattern_options = sorted([str(x) for x in master_df['Final_Pattern'].unique() if pd.notna(x) and str(x).strip() != ''])
         
         selected_oms = st.sidebar.multiselect("负责团队 (OM) 筛选", options=om_options)
         selected_patterns = st.sidebar.multiselect("产品款式 (Pattern) 筛选", options=pattern_options)
         
-        if selected_oms: master_df = master_df[master_df['OM'].isin(selected_oms)]
-        if selected_patterns: master_df = master_df[master_df['Pattern'].isin(selected_patterns)]
+        if selected_oms: master_df = master_df[master_df['Final_OM'].isin(selected_oms)]
+        if selected_patterns: master_df = master_df[master_df['Final_Pattern'].isin(selected_patterns)]
         if master_df.empty: st.warning("⚠️ 选择的组合下无任何匹配数据。"); st.stop()
 
         # ==================== 🛠️ 1. 子 ASIN 级排名拼装 ====================
@@ -236,21 +289,21 @@ try:
         
         df_sheet3_all = pd.DataFrame()
         df_sheet3_all['Rank'] = child_base['Rank']
-        df_sheet3_all['Parent ASIN'] = child_base['Parent ASIN']
-        df_sheet3_all['ASIN'] = child_base['ASIN']
-        df_sheet3_all['ItemNo'] = child_base['ItemNo']
-        df_sheet3_all['Division'] = child_base['Division']
-        df_sheet3_all['Brand'] = child_base['Brand']
-        df_sheet3_all['Category'] = child_base['Category']
-        df_sheet3_all['Subcategory'] = child_base['Subcategory']
-        df_sheet3_all['Pattern'] = child_base['Pattern']
-        df_sheet3_all['Color'] = child_base['Color']
-        df_sheet3_all['Size'] = child_base['Size']
-        df_sheet3_all['OM'] = child_base['OM']
-        df_sheet3_all['BucketsList'] = child_base['BucketsList']
-        df_sheet3_all['ClassificationCode'] = child_base['ClassificationCode']
-        df_sheet3_all['ProductTag'] = child_base['ProductTag']
-        df_sheet3_all['Retail Status'] = child_base['Retail Status']
+        df_sheet3_all['Parent ASIN'] = child_base['Final_Parent']
+        df_sheet3_all['ASIN'] = child_base['Final_ASIN']
+        df_sheet3_all['ItemNo'] = child_base['Final_ItemNo']
+        df_sheet3_all['Division'] = child_base['Final_Division']
+        df_sheet3_all['Brand'] = child_base['Final_Brand']
+        df_sheet3_all['Category'] = child_base['Final_Category']
+        df_sheet3_all['Subcategory'] = child_base['Final_Subcat']
+        df_sheet3_all['Pattern'] = child_base['Final_Pattern']
+        df_sheet3_all['Color'] = child_base['Final_Color']
+        df_sheet3_all['Size'] = child_base['Final_Size']
+        df_sheet3_all['OM'] = child_base['Final_OM']
+        df_sheet3_all['BucketsList'] = child_base['Final_Buckets']
+        df_sheet3_all['ClassificationCode'] = child_base['Final_Class']
+        df_sheet3_all['ProductTag'] = child_base['Product Tag']
+        df_sheet3_all['Retail Status'] = child_base['Final_Status']
         
         df_sheet3_all['预警层级'] = child_base['Alert_Type']
         df_sheet3_all['销量_PO Units'] = child_base['PO_Units'].astype(int)
@@ -267,9 +320,9 @@ try:
         df_sheet2_top50 = df_sheet3_all.head(50).copy()
 
         # ==================== 🛠️ 2. 父 ASIN 级排名拼装 ====================
-        parent_group = master_df.groupby('Parent ASIN').agg({
-            'ASIN': 'nunique', 'Division': 'first', 'Brand': 'first', 'Category': 'first', 'Subcategory': 'first',
-            'Pattern': 'first', 'OM': 'first', 'BucketsList': 'first', 'ProductTag': 'first', 'Retail Status': 'first',
+        parent_group = master_df.groupby('Final_Parent').agg({
+            'Final_ASIN': 'nunique', 'Final_Division': 'first', 'Final_Brand': 'first', 'Final_Category': 'first', 'Final_Subcat': 'first',
+            'Final_Pattern': 'first', 'Final_OM': 'first', 'Final_Buckets': 'first', 'Product Tag': 'first', 'Final_Status': 'first',
             'PO_Units': 'sum', 'Net_PPM_Val': 'mean', 'FC_Total': 'sum', 'JLA_Inv': 'sum', 'P70_Avg': 'sum'
         }).reset_index()
         
@@ -282,17 +335,17 @@ try:
         
         df_sheet5_all = pd.DataFrame()
         df_sheet5_all['排名'] = parent_active['排名']
-        df_sheet5_all['Parent ASIN'] = parent_active['Parent ASIN']
-        df_sheet5_all['ASIN Count'] = parent_active['ASIN']
-        df_sheet5_all['Division'] = parent_active['Division']
-        df_sheet5_all['Brand'] = parent_active['Brand']
-        df_sheet5_all['Category'] = parent_active['Category']
-        df_sheet5_all['Subcategory'] = parent_active['Subcategory']
-        df_sheet5_all['Pattern'] = parent_active['Pattern']
-        df_sheet5_all['OM'] = parent_active['OM']
-        df_sheet5_all['BucketsList'] = parent_active['BucketsList']
-        df_sheet5_all['ProductTag'] = parent_active['ProductTag']
-        df_sheet5_all['Retail Status'] = parent_active['Retail Status']
+        df_sheet5_all['Parent ASIN'] = parent_active['Final_Parent']
+        df_sheet5_all['ASIN Count'] = parent_active['Final_ASIN']
+        df_sheet5_all['Division'] = parent_active['Final_Division']
+        df_sheet5_all['Brand'] = parent_active['Final_Brand']
+        df_sheet5_all['Category'] = parent_active['Final_Category']
+        df_sheet5_all['Subcategory'] = parent_active['Final_Subcat']
+        df_sheet5_all['Pattern'] = parent_active['Final_Pattern']
+        df_sheet5_all['OM'] = parent_active['Final_OM']
+        df_sheet5_all['BucketsList'] = parent_active['Final_Buckets']
+        df_sheet5_all['ProductTag'] = parent_active['Product Tag']
+        df_sheet5_all['Retail Status'] = parent_active['Final_Status']
         
         df_sheet5_all['父体本周总PO销量'] = parent_active['PO_Units'].astype(int)
         df_sheet5_all['父体均值PPM'] = parent_active['Net_PPM_Val']
@@ -370,7 +423,6 @@ try:
         styler_s5 = apply_po_matrix_styles(df_sheet5_all)
         styler_s6 = apply_po_matrix_styles(df_sheet6_weekly)
 
-        # 动态计算子 ASIN 的预警触发项
         h_c = len(df_sheet3_all[df_sheet3_all['预警层级'].str.contains('提报|拦截|High', na=False)])
         m_c = len(df_sheet3_all[df_sheet3_all['预警层级'].str.contains('不足量|Medium', na=False)])
         l_c = len(df_sheet3_all[df_sheet3_all['预警层级'].str.contains('暴跌|Low', na=False)])
