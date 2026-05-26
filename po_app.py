@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import io
 import os
+from datetime import datetime
 
 st.set_page_config(page_title="VC Weekly PO 核心预警看板", layout="wide", initial_sidebar_state="expanded")
 st.title("🚨 Amazon VC Weekly PO 核心指标全域监测看板")
@@ -29,6 +30,10 @@ def get_trend_symbol(val_w2, val_w1):
     if diff > 0.02: return f"▲ +{diff:.0%}"
     elif diff < -0.02: return f"▼ {diff:.0%}"
     return "→ 0%"
+
+def build_driving_factors_text(s_chg, g_chg, p_chg, c_chg, sp_chg, tc_chg):
+    def sym(c): return '↑' if c > 0 else ('↓' if c < 0 else '→')
+    return f"销量{sym(s_chg)} GV{sym(g_chg)} 价格{sym(p_chg)} CVR{sym(c_chg)} SPSD{sym(sp_chg)} TACOS{sym(tc_chg)}"
 
 # --- 4-Tier 预警状态及优先级算法 (P70前置过滤) ---
 def calculate_po_alerts(row):
@@ -64,7 +69,7 @@ def calculate_po_alerts(row):
         
     return '无预警', 99
 
-# ==================== 📡 智能表头特征识别引擎（彻底解决对齐报错） ====================
+# ==================== 📡 智能表头特征识别引擎 ====================
 st.sidebar.header("📂 原始 PO 数据上传区")
 uploaded_files = st.sidebar.file_uploader(
     "请一次性多选上传你的 4 个原始表格 (无需修改文件名，直接拖入)", 
@@ -76,7 +81,6 @@ def load_and_merge_po_system(files):
     dfs = {'po': None, 'asin': None, 'p70': None, 'ppm': None}
     
     for f in files:
-        # 1. 尝试用常规模式探路读取
         try:
             if f.name.lower().endswith('.csv'):
                 test_df = pd.read_csv(f, nrows=5, header=None, low_memory=False)
@@ -85,15 +89,12 @@ def load_and_merge_po_system(files):
         except:
             continue
             
-        # 2. 扫描前 3 行，动态抓取特征列名来判定这是哪张表
         row_str_pool = []
         for r_idx in range(min(3, len(test_df))):
             row_str_pool.extend([str(x).strip().lower() for x in test_df.iloc[r_idx].dropna().tolist()])
         all_headers_combined = " ".join(row_str_pool)
 
-        # 3. 开启硬核表头指纹比对逻辑
         if 'requested quantity' in all_headers_combined or 'total requested cost' in all_headers_combined:
-            # 确认为原始 PO 表
             if f.name.lower().endswith('.csv'):
                 df = pd.read_csv(f, low_memory=False)
             else:
@@ -102,7 +103,6 @@ def load_and_merge_po_system(files):
             dfs['po'] = df
             
         elif 'classificationcode' in all_headers_combined or 'producttag' in all_headers_combined or 'jla inventory' in all_headers_combined:
-            # 确认为 ASIN INFO 基础属性表
             if f.name.lower().endswith('.csv'):
                 df = pd.read_csv(f, low_memory=False)
             else:
@@ -111,13 +111,11 @@ def load_and_merge_po_system(files):
             dfs['asin'] = df
             
         elif 'week 1' in all_headers_combined or 'week1' in all_headers_combined or 'forecast' in all_headers_combined:
-            # 确认为 P70 预测表 (自动执行跳过 meta 行读取)
             if f.name.lower().endswith('.csv'):
                 raw = pd.read_csv(f, header=None, low_memory=False)
             else:
                 raw = pd.read_excel(f, header=None)
             raw.iloc[:, 0] = raw.iloc[:, 0].ffill()
-            # 寻找真正的表头行
             header_row_idx = 1
             for i in range(min(5, len(raw))):
                 row_items = [str(x).lower() for x in raw.iloc[i].tolist()]
@@ -129,7 +127,6 @@ def load_and_merge_po_system(files):
             dfs['p70'] = df.reset_index(drop=True)
             
         elif 'net ppm %' in all_headers_combined or 'ppm' in all_headers_combined:
-            # 确认为 Net PPM 利润表 (自动跳行读取)
             if f.name.lower().endswith('.csv'):
                 raw = pd.read_csv(f, header=None, low_memory=False)
             else:
@@ -144,23 +141,20 @@ def load_and_merge_po_system(files):
             df.columns = [str(x).strip() for x in raw.iloc[header_row_idx].tolist()]
             dfs['ppm'] = df.reset_index(drop=True)
 
-    # 4. 严密的拦截警报
     missing_tables = []
-    if dfs['po'] is None: missing_tables.append("原始PO表 (需包含 Requested quantity 字段)")
-    if dfs['asin'] is None: missing_tables.append("ASIN基础信息表 (需包含 ClassificationCode 字段)")
-    if dfs['p70'] is None: missing_tables.append("P70预测表 (需包含 Week 1 等预测字段)")
+    if dfs['po'] is None: missing_tables.append("原始PO表 (Requested quantity)")
+    if dfs['asin'] is None: missing_tables.append("ASIN基础信息表 (ClassificationCode)")
+    if dfs['p70'] is None: missing_tables.append("P70预测表 (Week 1)")
     
     if missing_tables:
         err_details = "、".join(missing_tables)
-        return None, None, f"❌ 智能寻标对齐失败！系统未能通过表头特征识别出：【{err_details}】。请检查上传的表格中是否存在对应字段，或者联系系统开发负责人。"
+        return None, None, f"❌ 智能寻标对齐失败！系统未能识别：【{err_details}】。"
 
     po_df = dfs['po']
     asin_df = dfs['asin']
     
-    # 强制向下填充 Parent ASIN (第0列)
     asin_df.iloc[:, 0] = asin_df.iloc[:, 0].ffill()
     
-    # 5. 销量重算
     po_df['Requested_Units_Calc'] = po_df['Requested quantity'].apply(safe_float) * po_df['Case size'].apply(safe_float)
     po_df['Total_Cost_Calc'] = po_df['Total requested cost'].apply(safe_float)
     
@@ -171,19 +165,16 @@ def load_and_merge_po_system(files):
         'Window end': 'max'
     }).reset_index()
     
-    # 6. 过滤清洗规则
     asin_df = asin_df[~asin_df['Division'].isin(['PET', 'PETB', 'FUR', 'ART', 'LGT', 'RUG'])]
     asin_df = asin_df[~asin_df['ClassificationCode'].isin(['C', 'ARC'])]
     asin_df = asin_df[~asin_df['OM'].astype(str).str.lower().isin(['discontinued'])]
     
-    # 7. 多表交叉全连接
     master = pd.merge(asin_df, po_agg, on='ASIN', how='left')
     master['has_PO'] = master['Requested_Units_Calc'].notna()
     master['PO_Units'] = master['Requested_Units_Calc'].fillna(0)
     master['This_Wk_Cost'] = master['Total_Cost_Calc'].fillna(0)
     
     if dfs['ppm'] is not None:
-        # 处理可能错位的 PPM 列名
         ppm_col = [c for c in dfs['ppm'].columns if 'ppm' in str(c).lower()][0]
         ppm_sub = dfs['ppm'][['ASIN', ppm_col]].copy()
         ppm_sub['Net_PPM_Val'] = ppm_sub[ppm_col].apply(safe_float)
@@ -195,9 +186,10 @@ def load_and_merge_po_system(files):
     p70_cols = p70_df.columns.tolist()
     w1_8_cols = [c for c in p70_cols if 'week' in str(c).lower()][:8]
     if len(w1_8_cols) >= 8:
-        p70_df['P70_Avg'] = p70_df[w1_8_cols].applymap(safe_float).mean(axis=1)
-        w1_4_mean = p70_df[w1_8_cols[:4]].applymap(safe_float).mean(axis=1)
-        w5_8_mean = p70_df[w1_8_cols[4:8]].applymap(safe_float).mean(axis=1)
+        # 【核心修正】：全新 Pandas 环境下，将旧版的 applymap 改用新版规范 map 函数
+        p70_df['P70_Avg'] = p70_df[w1_8_cols].map(safe_float).mean(axis=1)
+        w1_4_mean = p70_df[w1_8_cols[:4]].map(safe_float).mean(axis=1)
+        w5_8_mean = p70_df[w1_8_cols[4:8]].map(safe_float).mean(axis=1)
         p70_df['trend_pct'] = (w5_8_mean - w1_4_mean) / w1_4_mean.replace(0, np.nan)
         p70_df['trend_pct'] = p70_df['trend_pct'].fillna(0.0)
         master = pd.merge(master, p70_df[['ASIN', 'P70_Avg', 'trend_pct']], on='ASIN', how='left')
@@ -215,7 +207,9 @@ def load_and_merge_po_system(files):
     master['AMZ_WOS'] = master['AMZ_WOS'].fillna(0.0)
 
     master['Product Tag'] = master['ProductTag'].fillna('Old')
-    master['波动驱动因素'] = "销量波动 转化监控 效率警戒"
+    
+    # 动态调取前面补齐的驱动因素逻辑
+    master['波动驱动因素'] = master.apply(lambda r: build_driving_factors_text(r['PO_Units'], r['FC_Total'], r['This_Wk_Cost'], 1.0, 1.0, 1.0), axis=1)
 
     master['Alert_Result'] = master.apply(calculate_po_alerts, axis=1)
     master['Alert_Type'] = master['Alert_Result'].apply(lambda x: x[0])
@@ -427,5 +421,5 @@ if uploaded_files:
     with tabs[4]: st.dataframe(styler_s5, use_container_width=True, height=550)
     with tabs[5]: st.dataframe(styler_s6, use_container_width=True, height=550)
 
-else:
-    st.info("👈 请在左侧栏一次性多选投入你的 4 份原始 PO 报表（支持 xlsx/csv/xls），系统会自动探测指纹对齐表头。")
+except Exception as e:
+    st.error(f"💥 发生运算错误：{e}")
